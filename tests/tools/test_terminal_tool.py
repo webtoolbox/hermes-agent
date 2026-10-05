@@ -1,4 +1,9 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for sudo detection, sudo password handling, and the
+foreground retry loop's environment re-resolution."""
+
+import json
+import time as _real_time
+from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
 import tools.terminal_tool_sudo as terminal_tool_sudo
@@ -122,3 +127,108 @@ def test_sudo_rewrite_preserves_env_operands_and_prose(monkeypatch):
 def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
     assert terminal_tool_sudo._count_real_sudo_invocations("grep sudo README.md") == 0
     assert terminal_tool_sudo._count_real_sudo_invocations("sudo a; sudo b") == 2
+
+
+# --- foreground retry: environment re-resolution ---
+
+class _FakeEnv:
+    """Minimal environment: records execute() calls, optional fixed failure."""
+
+    host_cwd = None
+    cwd = "/workspace"
+
+    def __init__(self, container_id, fail_with=None, fail_times=None):
+        self._container_id = container_id
+        self._fail_with = fail_with
+        # None -> fail forever; int -> fail the first N calls, then succeed
+        self._fail_times = fail_times
+        self.execute_calls = 0
+
+    def execute(self, command, **kwargs):
+        self.execute_calls += 1
+        if self._fail_with is not None and (
+            self._fail_times is None or self.execute_calls <= self._fail_times
+        ):
+            raise self._fail_with
+        return {"output": "ok", "returncode": 0}
+
+
+class _RecordingTime:
+    """``time`` stand-in whose sleep() is instant and recorded."""
+
+    sleeps: list = []
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+    def sleep(self, seconds):
+        type(self).sleeps.append(seconds)
+
+
+def _retry_plan():
+    return SimpleNamespace(
+        env_type="docker", effective_task_id="profile:x", effective_timeout=5,
+        cwd="/workspace", host_cwd=None,
+    )
+
+
+def _run_retry_call(env, monkeypatch, *, session_key, registry=None):
+    monkeypatch.setattr(terminal_tool, "_active_environments", dict(registry or {}))
+    monkeypatch.setattr(
+        terminal_tool, "_last_activity",
+        {key: _real_time.time() for key in (registry or {})},
+    )
+    _RecordingTime.sleeps = []
+    monkeypatch.setattr(terminal_tool, "time", _RecordingTime())
+    return terminal_tool._run_foreground(
+        "true", env, _retry_plan(), task_id=None, session_id=None,
+        session_key=session_key, workdir=None, approval_note=None,
+        clear_interrupt=False, metered=False,
+    )
+
+
+def test_retry_reacquires_environment_after_idle_reaper_tore_it_down(monkeypatch):
+    """Regression: the idle reaper can tear down the resolved handle between
+    attempts; every retry against it then fails identically (docker:
+    ``AssertionError: Container not started``) and the whole retry budget is
+    wasted. The next attempt must run on a re-acquired, live environment."""
+    dead = _FakeEnv(container_id=None, fail_with=AssertionError("Container not started"))
+    live = _FakeEnv(container_id="abc123")
+    acquired = []
+
+    def _acquire(plan, task_id):
+        acquired.append(task_id)
+        return live
+
+    monkeypatch.setattr(terminal_tool, "_acquire_env", _acquire)
+
+    result = json.loads(_run_retry_call(dead, monkeypatch, session_key="retry-reacquire"))
+
+    assert result["error"] is None, result
+    assert result["exit_code"] == 0, result
+    assert acquired, "the retry must re-acquire an environment after the handle was reaped"
+    assert dead.execute_calls == 1
+    assert live.execute_calls == 1
+    # backoff pacing is unchanged: the successful attempt came after one wait
+    assert _RecordingTime.sleeps == [2]
+
+
+def test_retry_keeps_a_live_registered_environment(monkeypatch):
+    """A still-registered, intact handle must be reused as-is — re-resolution
+    must never churn a healthy backend (a shared container would be rebuilt
+    under the other sessions using it)."""
+    env = _FakeEnv(container_id="abc123", fail_with=RuntimeError("connection reset"), fail_times=1)
+
+    def _no_acquire(plan, task_id):
+        raise AssertionError("a healthy registered environment must not be re-acquired")
+
+    monkeypatch.setattr(terminal_tool, "_acquire_env", _no_acquire)
+
+    result = json.loads(_run_retry_call(
+        env, monkeypatch, session_key="retry-keep", registry={"profile:x": env},
+    ))
+
+    assert result["error"] is None, result
+    assert result["exit_code"] == 0, result
+    assert env.execute_calls == 2
+    assert _RecordingTime.sleeps == [2]

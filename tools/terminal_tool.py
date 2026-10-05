@@ -1237,6 +1237,39 @@ def _yield_kwargs(command: str, **ctx) -> dict:
     return {"yield_handler": handler} if handler is not None else {}
 
 
+def _reresolve_env_for_retry(env: Any, plan: _ExecPlan, task_id: Optional[str]) -> Any:
+    """Environment for the next retry attempt.
+
+    A concurrent teardown — the idle reaper (``_cleanup_inactive_envs``),
+    session cleanup, an out-of-band ``docker rm`` — can invalidate the handle
+    this call resolved while it waits between attempts. Retrying that same
+    handle fails identically on every attempt (docker: ``AssertionError:
+    Container not started``), so the whole retry budget is spent proving the
+    environment is dead. Re-resolve instead: a still-registered, intact handle
+    is returned unchanged (a healthy retry never churns), while a reaped or
+    container-less one is evicted and rebuilt so the retry runs on a live
+    environment. ``local`` has nothing to re-resolve.
+    """
+    if plan.env_type == "local":
+        return env
+    try:
+        with _env_lock:
+            registered = _lookup_active_env(plan.effective_task_id, task_id)
+        if registered is None:
+            # Reaped while this call waited: bring the backend up again.
+            return _acquire_env(plan, task_id) or env
+        if registered is env and getattr(env, "_container_id", "unset") is None:
+            # Registered, but its container was torn down under us
+            # (``cleanup()`` clears the id): evict the dead handle so acquire
+            # builds a live one instead of handing the same object back.
+            _evict_environment_for_task(task_id)
+            return _acquire_env(plan, task_id) or env
+        return registered
+    except Exception:
+        logger.debug("retry env re-resolve failed; reusing the current handle", exc_info=True)
+        return env
+
+
 def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
@@ -1284,6 +1317,11 @@ def _run_foreground(
                 wait_time = 2 ** (retry_count + 1)
                 logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                wait_time, retry_count + 1, max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
+                # The handle may have been torn down while this call waited
+                # (idle reaper / session cleanup run concurrently); retrying a
+                # dead one fails identically, so re-resolve it before the next
+                # attempt.
+                env = _reresolve_env_for_retry(env, plan, task_id)
                 time.sleep(wait_time)
                 continue
             logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
